@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+data/*.csv
+
+model/*
+!model/.gitkeep
+
+temp/*
+!temp/.gitkeep
+
+*.tar

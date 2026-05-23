@@ -1,0 +1,12 @@
+services:
+  app:
+    image: bdc2026:latest
+    pull_policy: never
+    network_mode: none
+    volumes:
+      - ./data:/app/data
+      - ./model:/app/model
+      - ./output:/app/output
+      - ./temp:/app/temp
+    working_dir: /app
+    command: /bin/bash /app/run.sh

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync *)",
+      "Bash(python code/src/train.py)",
+      "Bash(uv run *)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}
