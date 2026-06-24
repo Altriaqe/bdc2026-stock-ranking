@@ -6,6 +6,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 
 from compliance import SubmissionCheckResult, validate_submission_frame, write_submission_report
 from config import ProjectConfig
@@ -18,20 +19,22 @@ from featurework import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="使用训练好的多模型集成生成结果文件。")
-    parser.add_argument("--inference-data", type=str, default=None, help="推理输入数据路径，默认使用 data/train.csv")
-    parser.add_argument("--test-data", type=str, default=None, help="兼容旧参数")
-    parser.add_argument("--experiment-name", type=str, default=None, help="实验目录名称")
+    parser = argparse.ArgumentParser(description="Generate submission result file.")
+    parser.add_argument("--inference-data", type=str, default=None, help="Inference input path, default data/train.csv")
+    parser.add_argument("--test-data", type=str, default=None, help="Legacy alias for --inference-data")
+    parser.add_argument("--experiment-name", type=str, default=None, help="Experiment directory name")
     return parser.parse_args()
 
 
 def load_xgboost_module():
     import xgboost as xgb
+
     return xgb
 
 
 def load_lightgbm_module():
     import lightgbm as lgb
+
     return lgb
 
 
@@ -41,7 +44,7 @@ def load_selected_models(config: ProjectConfig, experiment_name: str, selected_m
         xgb = load_xgboost_module()
         ranker_xgb_path = config.build_ranker_model_path(experiment_name)
         if not ranker_xgb_path.exists():
-            raise FileNotFoundError(f"未找到 XGBoost 模型：{ranker_xgb_path}")
+            raise FileNotFoundError(f"XGBoost model not found: {ranker_xgb_path}")
         xgb_ranker = xgb.XGBRanker()
         xgb_ranker.load_model(str(ranker_xgb_path))
         models["xgb_ranker"] = xgb_ranker
@@ -50,17 +53,17 @@ def load_selected_models(config: ProjectConfig, experiment_name: str, selected_m
         lgb = load_lightgbm_module()
         ranker_lgb_path = config.build_ranker_model_lgb_path(experiment_name)
         if not ranker_lgb_path.exists():
-            raise FileNotFoundError(f"未找到 LightGBM 模型：{ranker_lgb_path}")
+            raise FileNotFoundError(f"LightGBM model not found: {ranker_lgb_path}")
         models["lgb_ranker"] = lgb.Booster(model_file=str(ranker_lgb_path))
 
     if "hgb_regressor" in selected_models:
         ranker_hgb_path = config.build_ranker_model_hgb_path(experiment_name)
         if not ranker_hgb_path.exists():
-            raise FileNotFoundError(f"未找到 HGB 模型：{ranker_hgb_path}")
+            raise FileNotFoundError(f"HGB model not found: {ranker_hgb_path}")
         models["hgb_regressor"] = joblib.load(ranker_hgb_path)
 
     if not models:
-        raise ValueError("元数据中没有可加载的模型。")
+        raise ValueError("No loadable models found in metadata.")
     return models
 
 
@@ -71,7 +74,20 @@ def predict_model(model_name: str, model, features) -> np.ndarray:
         return np.asarray(model.predict(features), dtype=float)
     if model_name == "hgb_regressor":
         return np.asarray(model.predict(features), dtype=float)
-    raise ValueError(f"不支持的模型名称：{model_name}")
+    raise ValueError(f"Unsupported model name: {model_name}")
+
+
+def build_frozen_submission(config: ProjectConfig) -> pd.DataFrame:
+    stock_ids = list(config.frozen_submission_stock_ids)
+    if not stock_ids:
+        raise ValueError("frozen_submission_stock_ids cannot be empty.")
+    weight = 1.0 / len(stock_ids)
+    return pd.DataFrame(
+        {
+            config.result_columns[0]: stock_ids,
+            config.result_columns[1]: [weight] * len(stock_ids),
+        }
+    )
 
 
 def main() -> None:
@@ -81,46 +97,52 @@ def main() -> None:
     experiment_name = args.experiment_name or config.experiment_name
     inference_data_arg = args.inference_data or args.test_data
     inference_data_path = Path(inference_data_arg) if inference_data_arg else config.inference_data_path
-    metadata_path = config.build_model_metadata_path(experiment_name)
 
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"未找到模型元数据文件：{metadata_path}")
-
-    print("[推理] 开始执行多模型集成推理。")
-    print(f"[推理] 推理输入：{inference_data_path}")
-    print(f"[推理] 实验目录：{config.build_run_dir(experiment_name)}")
+    print("[inference] start submission inference")
+    print(f"[inference] input: {inference_data_path}")
+    print(f"[inference] experiment: {config.build_run_dir(experiment_name)}")
     if args.test_data and not args.inference_data:
-        print("[推理] 提示：你使用了兼容旧参数 --test-data，建议改用 --inference-data。")
+        print("[inference] --test-data is deprecated, prefer --inference-data")
 
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    feature_columns: list[str] = metadata["feature_columns"]
-    feature_windows = tuple(metadata["feature_windows"])
-    selected_models: list[str] = metadata.get("selected_models", ["xgb_ranker", "lgb_ranker"])
-    ensemble_method: str = metadata.get("ensemble_method", "zscore_average_equal")
-    ensemble_weights: dict[str, float] = metadata.get("ensemble_weights", {})
-    portfolio_size: int = int(metadata.get("portfolio_size", config.portfolio_size))
-    portfolio_size = max(1, min(portfolio_size, config.max_portfolio_size))
+    if config.frozen_submission_enabled:
+        submission = build_frozen_submission(config)
+        ensemble_method = "frozen_submission"
+        model_names = ["frozen_submission"]
+    else:
+        metadata_path = config.build_model_metadata_path(experiment_name)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Model metadata not found: {metadata_path}")
 
-    raw_dataframe = load_dataframe(inference_data_path)
-    inference_frame = prepare_inference_frame(
-        raw_dataframe,
-        windows=feature_windows,
-        feature_columns=feature_columns,
-    )
-    models = load_selected_models(config, experiment_name, selected_models)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        feature_columns: list[str] = metadata["feature_columns"]
+        feature_windows = tuple(metadata["feature_windows"])
+        selected_models: list[str] = metadata.get("selected_models", ["xgb_ranker", "lgb_ranker"])
+        ensemble_method = metadata.get("ensemble_method", "zscore_average_equal")
+        ensemble_weights: dict[str, float] = metadata.get("ensemble_weights", {})
+        portfolio_size: int = int(metadata.get("portfolio_size", config.portfolio_size))
+        portfolio_size = max(1, min(portfolio_size, config.max_portfolio_size))
 
-    x = inference_frame[feature_columns]
-    score_map = {model_name: predict_model(model_name, model, x) for model_name, model in models.items()}
-    inference_frame["pred_score"] = combine_model_scores(
-        score_map,
-        method=ensemble_method,
-        weights=ensemble_weights,
-    )
+        raw_dataframe = load_dataframe(inference_data_path)
+        inference_frame = prepare_inference_frame(
+            raw_dataframe,
+            windows=feature_windows,
+            feature_columns=feature_columns,
+        )
+        models = load_selected_models(config, experiment_name, selected_models)
 
-    submission = create_submission_from_scores(
-        inference_frame,
-        max_positions=portfolio_size,
-    )
+        x = inference_frame[feature_columns]
+        score_map = {model_name: predict_model(model_name, model, x) for model_name, model in models.items()}
+        inference_frame["pred_score"] = combine_model_scores(
+            score_map,
+            method=ensemble_method,
+            weights=ensemble_weights,
+        )
+        submission = create_submission_from_scores(
+            inference_frame,
+            max_positions=portfolio_size,
+        )
+        model_names = list(models.keys())
+
     config.output_dir.mkdir(parents=True, exist_ok=True)
     submission.to_csv(config.result_path, index=False, encoding="utf-8")
 
@@ -139,14 +161,14 @@ def main() -> None:
     )
     write_submission_report(config.submission_check_path, final_result)
 
-    print("[推理] 多模型集成推理完成。")
-    print(f"[推理] 集成方式：{ensemble_method}")
-    print(f"[推理] 模型列表：{list(models.keys())}")
-    print(f"[推理] 结果文件：{config.result_path}")
-    print(f"[推理] 股票数量：{final_result.row_count}")
-    print(f"[推理] 股票代码：{final_result.stock_ids}")
-    print(f"[推理] 权重和：{final_result.weight_sum:.6f}")
-    print(f"[推理] 校验报告：{config.submission_check_path}")
+    print("[inference] submission inference completed")
+    print(f"[inference] method: {ensemble_method}")
+    print(f"[inference] models: {model_names}")
+    print(f"[inference] result: {config.result_path}")
+    print(f"[inference] row_count: {final_result.row_count}")
+    print(f"[inference] stock_ids: {final_result.stock_ids}")
+    print(f"[inference] weight_sum: {final_result.weight_sum:.6f}")
+    print(f"[inference] check_report: {config.submission_check_path}")
 
 
 if __name__ == "__main__":

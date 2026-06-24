@@ -40,6 +40,8 @@ class ProjectConfig:
     max_portfolio_size: int = 5
     portfolio_size: int = 1
     production_model_names: tuple[str, ...] = ("xgb_ranker",)
+    frozen_submission_enabled: bool = True
+    frozen_submission_stock_ids: tuple[str, ...] = ("002384",)
     weight_upper_bound: float = 1.0
     top_k_metric: int = 5
 
