@@ -29,25 +29,34 @@ class ProjectConfig:
     feature_importance_filename: str = "feature_importance.csv"
     ranker_model_filename: str = "xgb_ranker.json"
     ranker_model_lgb_filename: str = "lgb_ranker.txt"
+    ranker_model_hgb_filename: str = "hgb_regressor.pkl"
     submission_check_filename: str = "submission_check.json"
     self_score_filename: str = "self_score.json"
 
-    experiment_name: str = "xgb_ranker_v2"
+    experiment_name: str = "xgb_ranker_v3"
     docker_image_name: str = "bdc2026"
     submission_tar_placeholder: str = "your_team_name.tar"
     result_columns: tuple[str, str] = ("stock_id", "weight")
     max_portfolio_size: int = 5
+    portfolio_size: int = 1
+    production_model_names: tuple[str, ...] = ("xgb_ranker",)
     weight_upper_bound: float = 1.0
     top_k_metric: int = 5
 
     feature_windows: tuple[int, ...] = (3, 5, 10, 20)
+    feature_preset: str = "alpha_v1"
     future_buy_offset: int = 1
     future_sell_offset: int = 5
     validation_ratio: float = 0.2
     min_train_groups: int = 3
+    walk_forward_fold_count: int = 3
     label_bucket_count: int = 10
+    label_return_clip_quantile: float = 0.0
+    head_sample_weight_quantile: float = 0.0
+    head_sample_weight_value: float = 1.0
     augmentation_noise_std: float = 0.01
     augmentation_noise_fraction: float = 0.3
+    continuous_target_clip_quantile: float = 0.02
     random_seed: int = 42
 
     xgb_objective: str = "rank:ndcg"
@@ -76,6 +85,13 @@ class ProjectConfig:
     lgb_reg_lambda: float = 1.0
     lgb_n_jobs: int = 1
     lgb_ndcg_eval_at: int = 5
+
+    hgb_learning_rate: float = 0.05
+    hgb_max_iter: int = 300
+    hgb_max_depth: int = 6
+    hgb_max_leaf_nodes: int = 31
+    hgb_min_samples_leaf: int = 30
+    hgb_l2_regularization: float = 0.1
 
     @property
     def train_data_path(self) -> Path:
@@ -128,6 +144,9 @@ class ProjectConfig:
 
     def build_ranker_model_lgb_path(self, experiment_name: str | None = None) -> Path:
         return self.build_run_dir(experiment_name) / self.ranker_model_lgb_filename
+
+    def build_ranker_model_hgb_path(self, experiment_name: str | None = None) -> Path:
+        return self.build_run_dir(experiment_name) / self.ranker_model_hgb_filename
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)

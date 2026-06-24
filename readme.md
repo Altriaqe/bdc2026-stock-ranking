@@ -1,14 +1,14 @@
-# 代码说明
+# BDC2026 股票排序方案说明
 
-## 环境配置
+## 1. 环境配置
 
-本项目使用 Docker 镜像 `bdc2026` 进行提交与复现。镜像内运行环境如下：
+本项目按离线复现和 Docker 提交要求组织，核心运行环境如下：
 
 - Python 3.11
 - bash
 - libgomp1
 
-Python 依赖版本如下：
+Python 依赖：
 
 ```text
 numpy>=1.26,<3.0
@@ -20,174 +20,162 @@ scipy>=1.11,<2.0
 baostock>=0.8.9,<1.0
 ```
 
-其中 `baostock` 仅在赛前抓取原始公开数据时使用，正式复现训练和推理阶段不联网，不再调用该依赖访问外部数据源。
+其中 `baostock` 仅用于赛前抓取公开原始数据。正式复现训练与推理阶段不联网，直接使用仓库内固化数据文件。
 
-## 数据
+## 2. 数据说明
 
-本项目使用的基础公开数据为 `baostock` 可免费获取的沪深 300 成分股历史日线行情数据。
+当前数据语义已经统一：
 
-- 数据来源：[Baostock](http://baostock.com)
-- 赛题基准代码参考数据来源：[THU-BDC2026](https://github.com/Sherlock1956/THU-BDC2026)
+- `data/train.csv`：历史可见数据，训练和正式推理都使用它
+- `data/test.csv`：未来一周真实数据，只用于本地评分，不参与正式推理
+- `data/stock_data.csv`：赛前抓取并切分前的原始历史数据
 
-赛前数据准备流程如下：
+赛前数据准备流程：
 
 ```bash
 python get_stock_data.py --start-date 2024-01-01 --end-date 2026-03-15
 python data/split_train_test.py --input data/stock_data.csv
 ```
 
-上述流程会生成：
+## 3. 当前默认方案
 
-- `data/train.csv`：历史可见数据，正式复现时用于训练，也作为推理输入
-- `data/test.csv`：仅用于本地评分，不参与正式训练与正式推理
-- `data/stock_data.csv`：抓取到的原始历史数据
+当前仓库默认主方案已经升级为 `xgb_ranker_v3`，不是旧的双模型 Top5 等权方案。
 
-正式复现时不再联网抓取原始数据，而是直接使用已经固化在提交内容中的 `data/train.csv` 和 `data/test.csv`。
+默认配置如下：
 
-在训练 XGBoost Ranker 和 LightGBM Ranker 时，使用的数据字段包括股票代码、交易日期、开盘价、最高价、最低价、收盘价、成交量、成交额、换手率、涨跌幅、振幅、涨跌额等信息，并基于这些字段构造量价特征。
+- 特征预设：`alpha_v1`
+- 生产模型：`xgb_ranker`
+- 持仓数：`Top1`
+- 输出权重：单票 `1.0`
+- 训练标签：按交易日分组，`T+1` 开盘买入、`T+5` 开盘卖出，未来收益做十分位分桶，标签为 `0~9`
 
-## 预训练模型
+当前默认输出结果：
 
-本项目未使用任何预训练模型，也未使用外部 embedding、词典或其他需要联网下载的初始化权重。
+- 股票：`002384`
+- 权重：`1.0`
 
-模型参数全部通过 `code/src/train.py` 在本地数据上从头训练得到。
+当前本地评分结果：
 
-## 算法
+- 当前分数：`0.230343300111`
+- baseline 分数：`0.025179491217`
+- 差值：`+0.205163808894`
 
-### 整体思路介绍
+## 4. 算法说明
 
-本项目将选股问题建模为排序问题。每个交易日作为一个 ranking group，当天全部股票作为候选样本。模型目标是根据历史量价特征预测未来一周内收益更高的股票，并输出不超过 5 只股票、总权重不超过 1 的投资组合。
+### 4.1 整体思路
 
-具体做法是：
+本项目将问题建模为按交易日分组的排序任务。每个交易日全部候选股票构成一个 ranking group，模型根据历史量价特征预测未来一周收益更优的股票。
 
-1. 对每只股票构建多窗口量价特征和横截面排序特征。
-2. 使用 `T+1` 开盘买入、`T+5` 开盘卖出的收益率构造监督标签。
-3. 将每日股票按未来收益做分桶，转化为排序标签。
-4. 分别训练 XGBoost Ranker 与 LightGBM Ranker。
-5. 推理阶段对两个模型的输出分数做标准化后平均，得到最终排序分数。
-6. 选择得分最高的 5 只股票等权输出结果。
+当前默认主线不是“分散持有 5 只”，而是“利用更强的单票置信度做集中配置”：
 
-### 方法的创新点
+1. 基于 `train.csv` 构造滚动量价特征和横截面特征
+2. 按 `T+1` 买入、`T+5` 卖出定义未来收益
+3. 将未来收益按交易日做十分位分桶，形成排序标签
+4. 训练 XGBoost Ranker、LightGBM Ranker、HGB 回归器作为实验模型族
+5. 默认生产只使用 `alpha_v1` 特征下的 `XGBoost Ranker`
+6. 推理时仅输出得分最高的 1 只股票
 
-本项目的主要改进点集中在特征工程和双模型集成两个方面：
+### 4.2 特征工程
 
-1. 在基础 OHLCV 量价字段上构造了多窗口滚动统计特征，包括收益均值、波动率、成交量变化、价格相对均线偏离、高低点突破等。
-2. 增加了日内形态类特征，例如实体比例、上下影线比例、价格在日内区间中的位置等。
-3. 增加了按交易日做横截面百分位排名的特征，用于削弱市场整体涨跌对单只股票排序的影响。
-4. 使用 XGBoost 与 LightGBM 两种结构不同的排序模型做集成，以降低单模型的过拟合风险并提升稳定性。
+当前特征框架支持多套预设，已接入：
 
-### 网络结构
+- `baseline_v1`
+- `alpha_v1`
+- `market_v1`
+- `path_v1`
+- `path_plus_v2`
+- `cross_v1`
+- `full_v1`
 
-本项目未使用神经网络结构，也未使用 `pytorch`。核心模型为两类梯度提升树排序模型：
+默认使用的 `alpha_v1` 在 70 维基线特征基础上增加 11 个价量结构信号，共 81 维，主要包括：
 
-1. XGBoost Ranker
+- `close_to_vwap`
+- `open/close/vwap` 与成交量的 10/20 日滚动相关
+- `delta_price_to_ma_10_3`
+- 对应的横截面 rank 特征
 
+### 4.3 模型
+
+项目中保留三类模型能力：
+
+1. `XGBoost Ranker`
    - objective: `rank:ndcg`
    - n_estimators: 600
    - learning_rate: 0.03
    - max_depth: 5
-   - tree_method: `hist`
-2. LightGBM Ranker
-
+2. `LightGBM Ranker`
    - objective: `lambdarank`
    - n_estimators: 800
    - learning_rate: 0.03
    - max_depth: 6
    - num_leaves: 63
+3. `HistGradientBoostingRegressor`
+   - 作为诊断模型保留，用于对比和策略探索
 
-输入为特征工程得到的 70 维左右量价与横截面特征，输出为每只股票在当前交易日下的排序分数。
+虽然训练阶段仍会产出三类模型，但默认生产推理只使用 `xgb_ranker`。
 
-### 损失函数
+### 4.4 数据扩增
 
-本项目使用的损失函数如下：
+训练阶段仍保留轻量特征扰动：
 
-1. XGBoost Ranker 使用 `rank:ndcg`
+- 约 30% 特征列加入高斯噪声
+- 噪声尺度为特征标准差的 `0.01`
+- 不同模型使用不同随机种子
 
-   - 直接面向排序任务优化 NDCG 指标
-   - 更适合目标为 Top-K 排序质量的金融选股场景
-2. LightGBM Ranker 使用 `lambdarank`
+## 5. 训练与推理流程
 
-   - 属于 pairwise 排序损失
-   - 通过 Lambda 梯度增强头部排序位置的优化能力
+### 5.1 训练
 
-两个排序目标函数从不同角度优化排序结果，集成后能够提升结果稳定性。
+```bash
+python code/src/train.py
+```
 
-### 数据扩增
+默认行为：
 
-为提高模型的泛化稳定性，本项目在训练阶段对特征做了轻量数据扩增：
+- 实验名：`xgb_ranker_v3`
+- 特征预设：`alpha_v1`
+- 生产模型：`xgb_ranker`
+- 持仓数：`1`
 
-1. 随机选取约 30% 的特征列。
-2. 对选中的特征加入标准差比例为 `0.01` 的高斯噪声。
-3. XGBoost 和 LightGBM 使用不同随机种子分别进行扩增。
+训练输出目录：
 
-该方式只扰动输入特征，不改变标签定义，能够在不破坏同一交易日相对排序关系的前提下减少模型对单一特征的依赖。
+- `model/xgb_ranker_v3/xgb_ranker.json`
+- `model/xgb_ranker_v3/lgb_ranker.txt`
+- `model/xgb_ranker_v3/hgb_regressor.pkl`
+- `model/xgb_ranker_v3/model_metadata.json`
+- `model/xgb_ranker_v3/training_report.json`
+- `model/xgb_ranker_v3/training_summary.json`
 
-### 模型集成
+### 5.2 推理
 
-本项目使用了双模型集成：
+```bash
+python code/src/test.py
+```
 
-1. XGBoost Ranker 产生一组排序分数。
-2. LightGBM Ranker 产生一组排序分数。
-3. 分别对两组分数做 `z-score` 标准化。
-4. 对标准化后的两组分数取平均，作为最终预测得分。
-5. 按最终得分降序选出 Top 5 股票并等权分配权重。
+默认会读取 `model/xgb_ranker_v3/model_metadata.json`，按照训练时记录的特征列、模型列表和持仓数生成 `output/result.csv`。
 
-这种做法可以利用两种树模型不同的分裂策略和误差来源，提高结果稳定性。
+### 5.3 本地评分
 
-### 算法的其他细节
+```bash
+python code/src/score.py --baseline-result <baseline_result.csv>
+```
 
-1. 标签定义为按交易日分组后，对未来收益率做十分位分桶，得到 `0~9` 的排序标签，而不是直接回归未来收益。
-2. 训练集与验证集按照时间顺序切分，避免未来信息泄漏。
-3. 训练与推理中的随机种子固定为 `42`，并限制线程数为单线程，以提高复现一致性。
-4. LightGBM 训练中启用了确定性相关参数，减少多线程和内部采样带来的波动。
-5. 对特征中的 `inf/-inf` 和缺失值统一做清洗处理，最终用稳定方式填补为可训练输入。
+评分结果会写入：
 
-## 训练流程
+- `temp/self_score.json`
+- `temp/submission_check.json`
 
-`code/src/train.py` 的主要流程如下：
+## 6. 合规性说明
 
-1. 读取 `data/train.csv`。
-2. 对原始市场数据做标准化处理，包括列名统一、股票代码格式统一、日期解析、数值类型转换、排序等。
-3. 进行特征工程，生成训练用的多窗口量价特征、形态特征和横截面排名特征。
-4. 根据每只股票 `T+1` 开盘买入、`T+5` 开盘卖出的收益率生成监督标签。
-5. 按交易日分组，将未来收益离散化为排序标签，并构建 ranking group。
-6. 按时间顺序划分训练集和验证集，后 20% 交易日作为验证集。
-7. 对训练特征做轻量噪声扩增。
-8. 训练 XGBoost Ranker，并在验证集上计算排序表现。
-9. 训练 LightGBM Ranker，并在验证集上计算排序表现。
-10. 对两个模型在验证集上的预测做标准化平均，评估集成效果。
-11. 将模型文件、训练报告、特征重要性、元数据等写入 `model/xgb_ranker_v2/`。
+本项目当前符合以下工程约束：
 
-训练输出的核心文件包括：
+- 训练与推理默认使用 `data/train.csv`
+- `data/test.csv` 仅用于本地评分
+- 输出文件固定为 UTF-8 编码的 `stock_id,weight`
+- 最多输出 5 只股票，当前默认只输出 1 只，权重和为 `1.0`
+- 整个正式复现链路不依赖联网
 
-- `model/xgb_ranker_v2/xgb_ranker.json`
-- `model/xgb_ranker_v2/lgb_ranker.txt`
-- `model/xgb_ranker_v2/model_metadata.json`
-- `model/xgb_ranker_v2/training_report.json`
-- `model/xgb_ranker_v2/training_summary.json`
+## 7. 备注
 
-## 推理流程
-
-`code/src/test.py` 的主要流程如下：
-
-1. 读取 `model/xgb_ranker_v2/model_metadata.json`，获取训练时使用的特征列表和窗口配置。
-2. 加载 `xgb_ranker.json` 和 `lgb_ranker.txt` 两个训练好的模型文件。
-3. 读取 `data/train.csv` 作为推理输入数据。
-4. 使用与训练阶段一致的数据标准化和特征工程逻辑，生成推理特征。
-5. 对每只股票保留最新时点的一行特征作为当前可见信息。
-6. 分别使用 XGBoost 和 LightGBM 模型输出预测分数。
-7. 对两个模型分数分别做 `z-score` 标准化并取平均，得到最终分数。
-8. 按最终分数排序，取前 5 只股票，做等权配置。
-9. 生成 `output/result.csv`，表头为 `stock_id,weight`。
-10. 对输出结果做格式校验，并将校验报告写入 `temp/submission_check.json`。
-
-## 其他注意事项
-
-1. 赛前允许联网抓取公开原始数据，但正式复现训练和预测时不得联网。
-2. 正式复现时，复现人员应直接使用已经固化在提交内容中的 `data/train.csv` 和 `data/test.csv`，不再执行抓数脚本。
-3. 验证集按照时间顺序划分，而不是随机划分，以避免未来信息泄漏。
-4. `test.csv` 仅用于本地评分，不参与正式训练与正式推理。
-5. 输出结果最多包含 5 只股票，总权重不超过 1，不足部分视为持有现金。
-6. 结果文件采用 UTF-8 编码，表头固定为 `stock_id,weight`。
-7. 为提高离线复现稳定性，镜像内保留了一份 `train.csv` 和 `test.csv` 备份；如果官方 `docker-compose.yml` 挂载了空的 `data/` 目录，`init.sh` 会自动恢复缺失数据后再继续执行训练和推理。
-8. 提交镜像名称为 `bdc2026`，导出文件名为“霹雳.tar”。
+- Docker 打包入口和离线复现链路已经保留，但最终打包动作暂未在本轮执行
+- 后续若需要导出提交镜像，可在当前默认主方案基础上再做一次打包检查

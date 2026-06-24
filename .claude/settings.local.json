@@ -6,7 +6,8 @@
       "Bash(uv run *)",
       "Bash(git rm *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git branch *)"
     ]
   }
 }
