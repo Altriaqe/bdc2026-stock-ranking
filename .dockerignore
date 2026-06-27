@@ -1,9 +1,17 @@
 .git
 .venv
+.agents
+.claude
+.codex
 __pycache__
 *.pyc
 *.pyo
 *.pyd
+*.tar
+*.zip
+*.7z
+*.rar
 docs/
+temp/
 *.md
 !readme.md

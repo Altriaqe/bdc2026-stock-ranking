@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPRODUCE_FROM_TRAIN="${REPRODUCE_FROM_TRAIN:-0}"
+REPRODUCE_FROM_TRAIN="${REPRODUCE_FROM_TRAIN:-1}"
 
 echo "[container] start init/train/test workflow"
 bash /app/init.sh

@@ -40,8 +40,10 @@ class ProjectConfig:
     max_portfolio_size: int = 5
     portfolio_size: int = 1
     production_model_names: tuple[str, ...] = ("xgb_ranker",)
-    frozen_submission_enabled: bool = True
-    frozen_submission_stock_ids: tuple[str, ...] = ("002384",)
+    production_score_overlay_enabled: bool = True
+    production_score_overlay_feature: str = "volume_ratio_20"
+    production_score_overlay_weight: float = 0.7
+    production_score_overlay_method: str = "additive_zscore"
     weight_upper_bound: float = 1.0
     top_k_metric: int = 5
 

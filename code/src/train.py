@@ -17,6 +17,7 @@ from featurework import (
     combine_model_scores,
     derive_validation_weights,
     load_dataframe,
+    safe_zscore,
     summarize_dataframe,
 )
 
@@ -403,8 +404,24 @@ def main() -> None:
         method=production_ensemble_method,
         weights=production_ensemble_weights,
     )
-    production_ensemble_metrics = calculate_top_k_return_metrics(
+    production_base_metrics = calculate_top_k_return_metrics(
         bundle.validation_frame.assign(pred_score=production_ensemble_scores),
+        k=config.top_k_metric,
+    )
+    if config.production_score_overlay_enabled:
+        if config.production_score_overlay_method != "additive_zscore":
+            raise ValueError(f"不支持的 production_score_overlay_method：{config.production_score_overlay_method}")
+        if config.production_score_overlay_feature not in bundle.validation_frame.columns:
+            raise ValueError(f"生产分数校正特征不存在：{config.production_score_overlay_feature}")
+        overlay_values = bundle.validation_frame[config.production_score_overlay_feature].to_numpy(dtype=float)
+        production_scores = (
+            safe_zscore(production_ensemble_scores)
+            + float(config.production_score_overlay_weight) * safe_zscore(overlay_values)
+        )
+    else:
+        production_scores = production_ensemble_scores
+    production_ensemble_metrics = calculate_top_k_return_metrics(
+        bundle.validation_frame.assign(pred_score=production_scores),
         k=config.top_k_metric,
     )
 
@@ -443,6 +460,12 @@ def main() -> None:
         "feature_preset": bundle.feature_preset,
         "feature_group_sizes": {group_name: len(columns) for group_name, columns in bundle.feature_groups.items()},
         "production_selected_models": production_selected_models,
+        "production_score_overlay": {
+            "enabled": bool(config.production_score_overlay_enabled),
+            "method": config.production_score_overlay_method,
+            "feature": config.production_score_overlay_feature,
+            "weight": float(config.production_score_overlay_weight),
+        },
         "portfolio_size": int(config.portfolio_size),
         "feature_columns": feature_columns,
     }
@@ -459,6 +482,13 @@ def main() -> None:
         "production_selected_models": production_selected_models,
         "production_ensemble_method": production_ensemble_method,
         "production_ensemble_weights": production_ensemble_weights,
+        "production_score_overlay": {
+            "enabled": bool(config.production_score_overlay_enabled),
+            "method": config.production_score_overlay_method,
+            "feature": config.production_score_overlay_feature,
+            "weight": float(config.production_score_overlay_weight),
+        },
+        "production_base_holdout_metrics": production_base_metrics,
         "production_holdout_metrics": production_ensemble_metrics,
         "top_features_xgb": imp_xgb.head(20).to_dict(orient="records"),
         "top_features_lgb": imp_lgb.head(20).to_dict(orient="records"),
@@ -470,6 +500,12 @@ def main() -> None:
         "selected_models": production_selected_models,
         "ensemble_method": production_ensemble_method,
         "ensemble_weights": production_ensemble_weights,
+        "score_overlay": {
+            "enabled": bool(config.production_score_overlay_enabled),
+            "method": config.production_score_overlay_method,
+            "feature": config.production_score_overlay_feature,
+            "weight": float(config.production_score_overlay_weight),
+        },
         "diagnostic_selected_models": ["xgb_ranker", "lgb_ranker", "hgb_regressor"],
         "diagnostic_ensemble_method": diagnostic_best_ensemble_method,
         "diagnostic_ensemble_weights": validation_weights,
