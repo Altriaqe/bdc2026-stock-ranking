@@ -350,9 +350,9 @@ def build_production_metadata(
 ) -> dict[str, object]:
     resolved = config or ProjectConfig()
     return {
-        "model_type": "xgboost_lightgbm_hgb_robust_rank_ensemble",
+        "model_type": "xgboost_lightgbm_hgb_equal_rank_ensemble",
         "selected_models": list(model_weights),
-        "ensemble_method": "shrunk_rank_average",
+        "ensemble_method": "equal_rank_average",
         "ensemble_weights": {name: float(weight) for name, weight in model_weights.items()},
         "feature_columns": feature_columns,
         "feature_windows": list(feature_windows),
@@ -641,8 +641,8 @@ def main() -> None:
         cap=config.model_weight_cap,
     )
     final_risk = select_final_risk_configuration(outer_leaderboards)
-    print(f"[训练] 稳健模型权重：{final_model_weights}")
-    print(f"[训练] 稳健组合参数：{final_risk}")
+    print(f"[训练] 诊断收缩权重：{final_model_weights}")
+    print(f"[训练] 诊断风险参数：{final_risk}")
 
     if args.production_models:
         production_selected_models = [item.strip() for item in args.production_models.split(",") if item.strip()]
@@ -652,8 +652,16 @@ def main() -> None:
     if set(production_selected_models) != required_models:
         raise ValueError("稳健生产路径必须同时使用 xgb_ranker、lgb_ranker 和 hgb_regressor。")
     production_selected_models = ["xgb_ranker", "lgb_ranker", "hgb_regressor"]
-    production_ensemble_method = "shrunk_rank_average"
-    production_ensemble_weights = {name: final_model_weights[name] for name in production_selected_models}
+    production_ensemble_method = "equal_rank_average"
+    production_ensemble_weights = {
+        name: 1.0 / len(production_selected_models) for name in production_selected_models
+    }
+    production_risk = {
+        "variance_penalty": 0.0,
+        "correlation_penalty": 0.0,
+        "cvar_penalty": 0.0,
+        "selection_reason": "fixed_equal_rank_top5_outperformed_tuned_outer_strategy",
+    }
 
     production_models = fit_all_models(ranking_frame.copy(), feature_columns, config)
 
@@ -693,7 +701,7 @@ def main() -> None:
         "feature_group_sizes": {group_name: len(columns) for group_name, columns in bundle.feature_groups.items()},
         "production_selected_models": production_selected_models,
         "production_ensemble_weights": production_ensemble_weights,
-        "production_risk_configuration": final_risk,
+        "production_risk_configuration": production_risk,
         "portfolio_size": int(config.portfolio_size),
         "feature_columns": feature_columns,
     }
@@ -703,10 +711,12 @@ def main() -> None:
         "purged_outer_folds": fold_reports,
         "aggregated_model_metrics": aggregated_model_metrics,
         "robust_model_scores": final_robust_model_scores,
+        "diagnostic_shrunk_ensemble_weights": final_model_weights,
+        "diagnostic_risk_configuration": final_risk,
         "production_selected_models": production_selected_models,
         "production_ensemble_method": production_ensemble_method,
         "production_ensemble_weights": production_ensemble_weights,
-        "production_risk_configuration": final_risk,
+        "production_risk_configuration": production_risk,
         "top_features_xgb": imp_xgb.head(20).to_dict(orient="records"),
         "top_features_lgb": imp_lgb.head(20).to_dict(orient="records"),
     }
@@ -717,8 +727,8 @@ def main() -> None:
         feature_columns=feature_columns,
         feature_windows=config.feature_windows,
         model_weights=production_ensemble_weights,
-        variance_penalty=float(final_risk["variance_penalty"]),
-        correlation_penalty=float(final_risk["correlation_penalty"]),
+        variance_penalty=float(production_risk["variance_penalty"]),
+        correlation_penalty=float(production_risk["correlation_penalty"]),
         config=config,
     )
     metadata_payload.update({
@@ -773,7 +783,7 @@ def main() -> None:
     print(f"[训练] 特征数量：{len(feature_columns)}")
     print(f"[训练] 生产集成：{production_ensemble_method}")
     print(f"[训练] 生产模型权重：{production_ensemble_weights}")
-    print(f"[训练] 生产组合参数：{final_risk}")
+    print(f"[训练] 生产组合参数：{production_risk}")
     print(f"[训练] XGBoost 模型：{ranker_model_xgb_path}")
     print(f"[训练] LightGBM 模型：{ranker_model_lgb_path}")
     print(f"[训练] HGB 模型：{ranker_model_hgb_path}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import date
 from pathlib import Path
 
 import baostock as bs
@@ -12,7 +13,12 @@ import pandas as pd
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="通过 baostock 直接下载沪深300股票历史数据。")
     parser.add_argument("--start-date", type=str, default="2024-01-01", help="开始日期，格式 YYYY-MM-DD")
-    parser.add_argument("--end-date", type=str, default="2026-03-15", help="结束日期，格式 YYYY-MM-DD")
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=date.today().isoformat(),
+        help="结束日期，格式 YYYY-MM-DD；默认使用运行当天，接口会返回最近可用交易日。",
+    )
     parser.add_argument(
         "--output",
         type=str,

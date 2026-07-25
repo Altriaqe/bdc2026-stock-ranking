@@ -10,7 +10,7 @@ def test_metadata_contains_reproducible_portfolio_configuration():
         correlation_penalty=0.25,
     )
     assert payload["selected_models"] == ["xgb_ranker", "lgb_ranker", "hgb_regressor"]
-    assert payload["ensemble_method"] == "shrunk_rank_average"
+    assert payload["ensemble_method"] == "equal_rank_average"
     assert payload["portfolio"] == {
         "size": 5,
         "candidate_pool_size": 15,

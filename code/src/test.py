@@ -111,7 +111,7 @@ def main() -> None:
     ensemble_method = metadata.get("ensemble_method", "")
     ensemble_weights: dict[str, float] = metadata.get("ensemble_weights", {})
     portfolio_config: dict[str, object] = metadata.get("portfolio", {})
-    if ensemble_method != "shrunk_rank_average":
+    if ensemble_method != "equal_rank_average":
         raise ValueError(f"Unsupported production ensemble method: {ensemble_method}")
     if set(selected_models) != {"xgb_ranker", "lgb_ranker", "hgb_regressor"}:
         raise ValueError("Robust production inference requires all three models.")
@@ -146,7 +146,7 @@ def main() -> None:
     model_names = list(models.keys())
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    submission.to_csv(config.result_path, index=False, encoding="utf-8")
+    submission.to_csv(config.result_path, index=False, encoding="utf-8", lineterminator="\n")
 
     check_result = validate_submission_frame(
         submission,
