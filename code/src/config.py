@@ -38,9 +38,9 @@ class ProjectConfig:
     submission_tar_placeholder: str = "your_team_name.tar"
     result_columns: tuple[str, str] = ("stock_id", "weight")
     max_portfolio_size: int = 5
-    portfolio_size: int = 1
-    production_model_names: tuple[str, ...] = ("xgb_ranker",)
-    production_score_overlay_enabled: bool = True
+    portfolio_size: int = 5
+    production_model_names: tuple[str, ...] = ("xgb_ranker", "lgb_ranker", "hgb_regressor")
+    production_score_overlay_enabled: bool = False
     production_score_overlay_feature: str = "volume_ratio_20"
     production_score_overlay_weight: float = 0.7
     production_score_overlay_method: str = "additive_zscore"
@@ -51,9 +51,14 @@ class ProjectConfig:
     feature_preset: str = "alpha_v1"
     future_buy_offset: int = 1
     future_sell_offset: int = 5
-    validation_ratio: float = 0.2
-    min_train_groups: int = 3
-    walk_forward_fold_count: int = 3
+    validation_ratio: float = 0.1
+    min_train_groups: int = 252
+    inner_min_train_groups: int = 126
+    walk_forward_fold_count: int = 4
+    purge_group_count: int = 5
+    rebalance_stride: int = 5
+    outer_walk_forward_fold_count: int = 4
+    inner_walk_forward_fold_count: int = 3
     label_bucket_count: int = 10
     label_return_clip_quantile: float = 0.0
     head_sample_weight_quantile: float = 0.0
@@ -62,6 +67,17 @@ class ProjectConfig:
     augmentation_noise_fraction: float = 0.3
     continuous_target_clip_quantile: float = 0.02
     random_seed: int = 42
+
+    portfolio_candidate_pool_size: int = 15
+    portfolio_covariance_window: int = 60
+    portfolio_weight: float = 0.2
+    model_weight_shrinkage: float = 0.5
+    model_weight_cap: float = 0.5
+    variance_penalty_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0)
+    correlation_penalty_grid: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5)
+    cvar_penalty_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0)
+    backtest_report_filename: str = "backtest_report.json"
+    portfolio_report_filename: str = "portfolio_report.json"
 
     xgb_objective: str = "rank:ndcg"
     xgb_eval_metric: str = "ndcg@5"
@@ -142,6 +158,12 @@ class ProjectConfig:
 
     def build_feature_importance_path(self, experiment_name: str | None = None) -> Path:
         return self.build_run_dir(experiment_name) / self.feature_importance_filename
+
+    def build_backtest_report_path(self, experiment_name: str | None = None) -> Path:
+        return self.build_run_dir(experiment_name) / self.backtest_report_filename
+
+    def build_portfolio_report_path(self, experiment_name: str | None = None) -> Path:
+        return self.build_run_dir(experiment_name) / self.portfolio_report_filename
 
     def build_ranker_model_path(self, experiment_name: str | None = None) -> Path:
         return self.build_run_dir(experiment_name) / self.ranker_model_filename

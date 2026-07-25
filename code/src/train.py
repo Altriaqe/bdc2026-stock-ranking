@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
+from collections import defaultdict
 from pathlib import Path
 
 import joblib
@@ -10,16 +12,19 @@ import numpy as np
 import pandas as pd
 
 from config import ProjectConfig
+from backtest import evaluate_parameter_grid, evaluate_portfolio_series
 from featurework import (
+    build_purged_walk_forward_splits,
     build_training_bundle,
-    build_walk_forward_splits,
     calculate_top_k_return_metrics,
     combine_model_scores,
     derive_validation_weights,
     load_dataframe,
     safe_zscore,
+    standardize_market_dataframe,
     summarize_dataframe,
 )
+from portfolio import combine_rank_scores, shrink_model_weights
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +43,30 @@ def parse_args() -> argparse.Namespace:
 
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
+
+
+def _json_default(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (pd.Timestamp,)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def set_seed(seed: int) -> None:
@@ -260,6 +288,187 @@ def summarize_fold_metrics(metric_records: list[dict[str, dict[str, float]]]) ->
     return summary
 
 
+def derive_robust_model_scores(
+    metric_records: list[dict[str, dict[str, float]]],
+) -> dict[str, float]:
+    if not metric_records:
+        raise ValueError("model metric records are empty")
+    model_names = list(metric_records[0])
+    robust_scores: dict[str, float] = {}
+    for model_name in model_names:
+        relative_values = np.asarray(
+            [fold[model_name]["top_k_relative_score"] for fold in metric_records],
+            dtype=float,
+        )
+        return_values = np.asarray(
+            [fold[model_name]["pred_top_k_return_mean"] for fold in metric_records],
+            dtype=float,
+        )
+        finite_relative = relative_values[np.isfinite(relative_values)]
+        finite_returns = return_values[np.isfinite(return_values)]
+        if finite_relative.size == 0 or finite_returns.size == 0:
+            robust_scores[model_name] = 0.0
+            continue
+        score = float(np.median(finite_relative))
+        if float(np.median(finite_returns)) <= 0.0:
+            score = min(score, 0.0)
+        robust_scores[model_name] = score
+    return robust_scores
+
+
+def build_rank_scored_frame(
+    frame: pd.DataFrame,
+    score_map: dict[str, np.ndarray],
+    model_weights: dict[str, float],
+) -> pd.DataFrame:
+    selected_scores = {name: score_map[name] for name in model_weights}
+    combined = combine_rank_scores(
+        selected_scores,
+        model_weights,
+        frame["stock_id"],
+    )
+    result = frame.copy()
+    result["pred_score"] = combined
+    return result
+
+
+def frame_records(frame: pd.DataFrame) -> list[dict[str, object]]:
+    serializable = frame.copy()
+    if "trade_date" in serializable.columns:
+        serializable["trade_date"] = pd.to_datetime(serializable["trade_date"]).dt.strftime("%Y-%m-%d")
+    return serializable.to_dict(orient="records")
+
+
+def build_production_metadata(
+    *,
+    feature_columns: list[str],
+    feature_windows: tuple[int, ...],
+    model_weights: dict[str, float],
+    variance_penalty: float,
+    correlation_penalty: float,
+    config: ProjectConfig | None = None,
+) -> dict[str, object]:
+    resolved = config or ProjectConfig()
+    return {
+        "model_type": "xgboost_lightgbm_hgb_robust_rank_ensemble",
+        "selected_models": list(model_weights),
+        "ensemble_method": "shrunk_rank_average",
+        "ensemble_weights": {name: float(weight) for name, weight in model_weights.items()},
+        "feature_columns": feature_columns,
+        "feature_windows": list(feature_windows),
+        "portfolio": {
+            "size": 5,
+            "candidate_pool_size": int(resolved.portfolio_candidate_pool_size),
+            "covariance_window": int(resolved.portfolio_covariance_window),
+            "variance_penalty": float(variance_penalty),
+            "correlation_penalty": float(correlation_penalty),
+            "weight": float(resolved.portfolio_weight),
+        },
+    }
+
+
+def select_final_risk_configuration(
+    outer_leaderboards: list[list[dict[str, object]]],
+) -> dict[str, float]:
+    if not outer_leaderboards:
+        raise ValueError("outer risk leaderboards are empty")
+    rank_map: dict[tuple[float, float, float], list[int]] = defaultdict(list)
+    robust_map: dict[tuple[float, float, float], list[float]] = defaultdict(list)
+    for leaderboard in outer_leaderboards:
+        for rank, row in enumerate(leaderboard, start=1):
+            key = (
+                float(row["variance_penalty"]),
+                float(row["correlation_penalty"]),
+                float(row["cvar_penalty"]),
+            )
+            rank_map[key].append(rank)
+            robust_map[key].append(float(row["robust_score"]))
+    complete_keys = [key for key, ranks in rank_map.items() if len(ranks) == len(outer_leaderboards)]
+    if not complete_keys:
+        raise ValueError("no risk configuration appears in every outer fold")
+    best_key = min(
+        complete_keys,
+        key=lambda key: (
+            float(np.median(rank_map[key])),
+            -float(np.mean(robust_map[key])),
+            sum(key),
+            key,
+        ),
+    )
+    return {
+        "variance_penalty": best_key[0],
+        "correlation_penalty": best_key[1],
+        "cvar_penalty": best_key[2],
+        "median_outer_rank": float(np.median(rank_map[best_key])),
+        "mean_outer_robust_score": float(np.mean(robust_map[best_key])),
+    }
+
+
+def run_inner_selection(
+    outer_train_frame: pd.DataFrame,
+    feature_columns: list[str],
+    market_frame: pd.DataFrame,
+    config: ProjectConfig,
+) -> tuple[dict[str, float], dict[str, float], dict[str, object]]:
+    inner_splits = build_purged_walk_forward_splits(
+        outer_train_frame,
+        fold_count=config.inner_walk_forward_fold_count,
+        validation_ratio=config.validation_ratio,
+        min_train_groups=config.inner_min_train_groups,
+        purge_groups=config.purge_group_count,
+    )
+    inner_metric_records: list[dict[str, dict[str, float]]] = []
+    inner_outputs: list[tuple[pd.DataFrame, dict[str, np.ndarray]]] = []
+    for inner_index, (inner_train, inner_validation) in enumerate(inner_splits, start=1):
+        print(
+            f"[训练]   Inner {inner_index}/{len(inner_splits)}："
+            f"train_dates={inner_train['trade_date'].nunique()} valid_dates={inner_validation['trade_date'].nunique()}"
+        )
+        models = fit_all_models(inner_train, feature_columns, config)
+        metrics, _, score_map = evaluate_models_on_frame(
+            inner_validation,
+            feature_columns,
+            models,
+            ["rank_average_equal"],
+        )
+        inner_metric_records.append(metrics)
+        inner_outputs.append((inner_validation, score_map))
+
+    robust_scores = derive_robust_model_scores(inner_metric_records)
+    model_weights = shrink_model_weights(
+        robust_scores,
+        shrinkage=config.model_weight_shrinkage,
+        cap=config.model_weight_cap,
+    )
+    inner_scored = pd.concat(
+        [build_rank_scored_frame(frame, score_map, model_weights) for frame, score_map in inner_outputs],
+        ignore_index=True,
+    )
+    selected_risk, leaderboard, details_by_key = evaluate_parameter_grid(
+        inner_scored,
+        market_frame,
+        candidate_pool_size=config.portfolio_candidate_pool_size,
+        covariance_window=config.portfolio_covariance_window,
+        variance_penalties=config.variance_penalty_grid,
+        correlation_penalties=config.correlation_penalty_grid,
+        cvar_penalties=config.cvar_penalty_grid,
+        rebalance_stride=config.rebalance_stride,
+    )
+    details_key = (
+        f"variance={selected_risk['variance_penalty']}|"
+        f"correlation={selected_risk['correlation_penalty']}"
+    )
+    report = {
+        "split_count": len(inner_splits),
+        "robust_model_scores": robust_scores,
+        "model_weights": model_weights,
+        "selected_risk": selected_risk,
+        "leaderboard": leaderboard,
+        "selected_weekly_details": frame_records(details_by_key[details_key]),
+    }
+    return model_weights, selected_risk, report
+
+
 def main() -> None:
     args = parse_args()
     base_config = ProjectConfig()
@@ -328,102 +537,125 @@ def main() -> None:
     )
     ranking_frame = bundle.ranking_frame.copy()
     feature_columns = bundle.feature_columns
-    walk_forward_splits = build_walk_forward_splits(
+    market_frame = standardize_market_dataframe(raw_dataframe)
+    walk_forward_splits = build_purged_walk_forward_splits(
         ranking_frame,
-        fold_count=config.walk_forward_fold_count,
+        fold_count=config.outer_walk_forward_fold_count,
         validation_ratio=config.validation_ratio,
         min_train_groups=config.min_train_groups,
+        purge_groups=config.purge_group_count,
     )
 
-    ensemble_methods = [
-        "zscore_average_equal",
-        "rank_average_equal",
-        "validation_weighted_zscore_average",
-    ]
     fold_model_metrics: list[dict[str, dict[str, float]]] = []
-    fold_ensemble_metrics: list[dict[str, dict[str, float]]] = []
     fold_reports: list[dict[str, object]] = []
+    outer_leaderboards: list[list[dict[str, object]]] = []
 
     for fold_index, (train_frame, validation_frame) in enumerate(walk_forward_splits, start=1):
         print(
-            f"[训练] Fold {fold_index}/{len(walk_forward_splits)}："
+            f"[训练] Outer {fold_index}/{len(walk_forward_splits)}："
             f" train_dates={train_frame['trade_date'].nunique()} valid_dates={validation_frame['trade_date'].nunique()}"
         )
+        inner_weights, inner_risk, inner_report = run_inner_selection(
+            train_frame,
+            feature_columns,
+            market_frame,
+            config,
+        )
         trained_models = fit_all_models(train_frame, feature_columns, config)
-        model_metrics, ensemble_metrics, _ = evaluate_models_on_frame(
+        model_metrics, _, score_map = evaluate_models_on_frame(
             validation_frame,
             feature_columns,
             trained_models,
-            ensemble_methods,
+            ["rank_average_equal"],
         )
         fold_model_metrics.append(model_metrics)
-        fold_ensemble_metrics.append(ensemble_metrics)
+        robust_scored = build_rank_scored_frame(validation_frame, score_map, inner_weights)
+        robust_details, robust_statistics = evaluate_portfolio_series(
+            robust_scored,
+            market_frame,
+            candidate_pool_size=config.portfolio_candidate_pool_size,
+            covariance_window=config.portfolio_covariance_window,
+            variance_penalty=float(inner_risk["variance_penalty"]),
+            correlation_penalty=float(inner_risk["correlation_penalty"]),
+            rebalance_stride=config.rebalance_stride,
+        )
+        _, outer_leaderboard, _ = evaluate_parameter_grid(
+            robust_scored,
+            market_frame,
+            candidate_pool_size=config.portfolio_candidate_pool_size,
+            covariance_window=config.portfolio_covariance_window,
+            variance_penalties=config.variance_penalty_grid,
+            correlation_penalties=config.correlation_penalty_grid,
+            cvar_penalties=config.cvar_penalty_grid,
+            rebalance_stride=config.rebalance_stride,
+        )
+        outer_leaderboards.append(outer_leaderboard)
+
+        xgb_scores = score_map["xgb_ranker"]
+        current_overlay_scores = safe_zscore(xgb_scores)
+        if "volume_ratio_20" in validation_frame.columns:
+            current_overlay_scores = current_overlay_scores + 0.7 * safe_zscore(
+                validation_frame["volume_ratio_20"].to_numpy(dtype=float)
+            )
+        current_top1_metrics = calculate_top_k_return_metrics(
+            validation_frame.assign(pred_score=current_overlay_scores),
+            k=1,
+            rebalance_stride=config.rebalance_stride,
+        )
+        xgb_top5_metrics = calculate_top_k_return_metrics(
+            validation_frame.assign(pred_score=xgb_scores),
+            k=5,
+            rebalance_stride=config.rebalance_stride,
+        )
+        equal_model_weights = {name: 1.0 / len(score_map) for name in score_map}
+        equal_rank_scored = build_rank_scored_frame(validation_frame, score_map, equal_model_weights)
+        equal_rank_top5_metrics = calculate_top_k_return_metrics(
+            equal_rank_scored,
+            k=5,
+            rebalance_stride=config.rebalance_stride,
+        )
         fold_reports.append(
             {
                 "fold_index": fold_index,
                 "train_group_count": int(train_frame["trade_date"].nunique()),
                 "validation_group_count": int(validation_frame["trade_date"].nunique()),
+                "purge_group_count": int(config.purge_group_count),
+                "inner_selection": inner_report,
                 "model_metrics": model_metrics,
-                "ensemble_metrics": ensemble_metrics,
+                "strategy_metrics": {
+                    "current_overlay_top1": current_top1_metrics,
+                    "xgb_top5_equal_weight": xgb_top5_metrics,
+                    "equal_rank_ensemble_top5": equal_rank_top5_metrics,
+                    "robust_risk_controlled_top5": robust_statistics,
+                },
+                "robust_weekly_details": frame_records(robust_details),
+                "outer_parameter_leaderboard": outer_leaderboard,
             }
         )
 
     aggregated_model_metrics = summarize_fold_metrics(fold_model_metrics)
-    aggregated_ensemble_metrics = summarize_fold_metrics(fold_ensemble_metrics)
-    validation_weights = derive_validation_weights(aggregated_model_metrics, "top_k_relative_score")
-
-    diagnostic_best_ensemble_method = max(
-        aggregated_ensemble_metrics.items(),
-        key=lambda item: item[1].get("top_k_relative_score", float("-inf")),
-    )[0]
-    print(f"[训练] 诊断最优集成方式：{diagnostic_best_ensemble_method}")
-    print(f"[训练] 诊断模型权重：{validation_weights}")
+    final_robust_model_scores = derive_robust_model_scores(fold_model_metrics)
+    final_model_weights = shrink_model_weights(
+        final_robust_model_scores,
+        shrinkage=config.model_weight_shrinkage,
+        cap=config.model_weight_cap,
+    )
+    final_risk = select_final_risk_configuration(outer_leaderboards)
+    print(f"[训练] 稳健模型权重：{final_model_weights}")
+    print(f"[训练] 稳健组合参数：{final_risk}")
 
     if args.production_models:
         production_selected_models = [item.strip() for item in args.production_models.split(",") if item.strip()]
     else:
         production_selected_models = list(base_config.production_model_names)
-    if not production_selected_models:
-        raise ValueError("production_models 不能为空。")
-    unsupported_models = [name for name in production_selected_models if name not in {"xgb_ranker", "lgb_ranker", "hgb_regressor"}]
-    if unsupported_models:
-        raise ValueError(f"存在不支持的 production_models：{unsupported_models}")
-    production_ensemble_method = "zscore_average_equal"
-    equal_weight = 1.0 / len(production_selected_models)
-    production_ensemble_weights = {model_name: equal_weight for model_name in production_selected_models}
+    required_models = {"xgb_ranker", "lgb_ranker", "hgb_regressor"}
+    if set(production_selected_models) != required_models:
+        raise ValueError("稳健生产路径必须同时使用 xgb_ranker、lgb_ranker 和 hgb_regressor。")
+    production_selected_models = ["xgb_ranker", "lgb_ranker", "hgb_regressor"]
+    production_ensemble_method = "shrunk_rank_average"
+    production_ensemble_weights = {name: final_model_weights[name] for name in production_selected_models}
 
-    production_models = fit_all_models(bundle.train_frame.copy(), feature_columns, config)
-    validation_model_metrics, validation_ensemble_metrics, validation_score_map = evaluate_models_on_frame(
-        bundle.validation_frame,
-        feature_columns,
-        production_models,
-        ensemble_methods,
-    )
-    production_ensemble_scores = combine_model_scores(
-        {name: validation_score_map[name] for name in production_selected_models},
-        method=production_ensemble_method,
-        weights=production_ensemble_weights,
-    )
-    production_base_metrics = calculate_top_k_return_metrics(
-        bundle.validation_frame.assign(pred_score=production_ensemble_scores),
-        k=config.top_k_metric,
-    )
-    if config.production_score_overlay_enabled:
-        if config.production_score_overlay_method != "additive_zscore":
-            raise ValueError(f"不支持的 production_score_overlay_method：{config.production_score_overlay_method}")
-        if config.production_score_overlay_feature not in bundle.validation_frame.columns:
-            raise ValueError(f"生产分数校正特征不存在：{config.production_score_overlay_feature}")
-        overlay_values = bundle.validation_frame[config.production_score_overlay_feature].to_numpy(dtype=float)
-        production_scores = (
-            safe_zscore(production_ensemble_scores)
-            + float(config.production_score_overlay_weight) * safe_zscore(overlay_values)
-        )
-    else:
-        production_scores = production_ensemble_scores
-    production_ensemble_metrics = calculate_top_k_return_metrics(
-        bundle.validation_frame.assign(pred_score=production_scores),
-        k=config.top_k_metric,
-    )
+    production_models = fit_all_models(ranking_frame.copy(), feature_columns, config)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     production_models["xgb_ranker"].save_model(str(ranker_model_xgb_path))
@@ -444,14 +676,14 @@ def main() -> None:
     write_json(project_config_path, config_payload)
 
     training_summary_payload = {
-        "message": "多模型股票排序集成训练完成。",
+        "message": "稳健 Top5 多模型股票排序训练完成。",
         "raw_data_summary": raw_summary,
         "ranking_rows": int(len(ranking_frame)),
-        "train_rows": int(len(bundle.train_frame)),
-        "validation_rows": int(len(bundle.validation_frame)),
-        "train_groups": int(bundle.train_frame["trade_date"].nunique()),
-        "validation_groups": int(bundle.validation_frame["trade_date"].nunique()),
+        "production_train_rows": int(len(ranking_frame)),
+        "production_train_groups": int(ranking_frame["trade_date"].nunique()),
         "walk_forward_fold_count": int(len(walk_forward_splits)),
+        "purge_group_count": int(config.purge_group_count),
+        "rebalance_stride": int(config.rebalance_stride),
         "label_bucket_count": int(config.label_bucket_count),
         "label_return_clip_quantile": float(config.label_return_clip_quantile),
         "head_sample_weight_quantile": float(config.head_sample_weight_quantile),
@@ -460,70 +692,59 @@ def main() -> None:
         "feature_preset": bundle.feature_preset,
         "feature_group_sizes": {group_name: len(columns) for group_name, columns in bundle.feature_groups.items()},
         "production_selected_models": production_selected_models,
-        "production_score_overlay": {
-            "enabled": bool(config.production_score_overlay_enabled),
-            "method": config.production_score_overlay_method,
-            "feature": config.production_score_overlay_feature,
-            "weight": float(config.production_score_overlay_weight),
-        },
+        "production_ensemble_weights": production_ensemble_weights,
+        "production_risk_configuration": final_risk,
         "portfolio_size": int(config.portfolio_size),
         "feature_columns": feature_columns,
     }
     write_json(training_summary_path, training_summary_payload)
 
     training_report_payload = {
-        "walk_forward_folds": fold_reports,
+        "purged_outer_folds": fold_reports,
         "aggregated_model_metrics": aggregated_model_metrics,
-        "aggregated_ensemble_metrics": aggregated_ensemble_metrics,
-        "holdout_model_metrics": validation_model_metrics,
-        "holdout_ensemble_metrics": validation_ensemble_metrics,
-        "diagnostic_best_ensemble_method": diagnostic_best_ensemble_method,
-        "diagnostic_model_weights": validation_weights,
+        "robust_model_scores": final_robust_model_scores,
         "production_selected_models": production_selected_models,
         "production_ensemble_method": production_ensemble_method,
         "production_ensemble_weights": production_ensemble_weights,
-        "production_score_overlay": {
-            "enabled": bool(config.production_score_overlay_enabled),
-            "method": config.production_score_overlay_method,
-            "feature": config.production_score_overlay_feature,
-            "weight": float(config.production_score_overlay_weight),
-        },
-        "production_base_holdout_metrics": production_base_metrics,
-        "production_holdout_metrics": production_ensemble_metrics,
+        "production_risk_configuration": final_risk,
         "top_features_xgb": imp_xgb.head(20).to_dict(orient="records"),
         "top_features_lgb": imp_lgb.head(20).to_dict(orient="records"),
     }
     write_json(training_report_path, training_report_payload)
+    write_json(config.build_backtest_report_path(experiment_name), training_report_payload)
 
-    metadata_payload = {
-        "model_type": "xgboost_lightgbm_hgb_ensemble",
-        "selected_models": production_selected_models,
-        "ensemble_method": production_ensemble_method,
-        "ensemble_weights": production_ensemble_weights,
-        "score_overlay": {
-            "enabled": bool(config.production_score_overlay_enabled),
-            "method": config.production_score_overlay_method,
-            "feature": config.production_score_overlay_feature,
-            "weight": float(config.production_score_overlay_weight),
-        },
-        "diagnostic_selected_models": ["xgb_ranker", "lgb_ranker", "hgb_regressor"],
-        "diagnostic_ensemble_method": diagnostic_best_ensemble_method,
-        "diagnostic_ensemble_weights": validation_weights,
+    metadata_payload = build_production_metadata(
+        feature_columns=feature_columns,
+        feature_windows=config.feature_windows,
+        model_weights=production_ensemble_weights,
+        variance_penalty=float(final_risk["variance_penalty"]),
+        correlation_penalty=float(final_risk["correlation_penalty"]),
+        config=config,
+    )
+    metadata_payload.update({
         "experiment_name": experiment_name,
-        "feature_columns": feature_columns,
         "feature_preset": bundle.feature_preset,
         "feature_group_sizes": {group_name: len(columns) for group_name, columns in bundle.feature_groups.items()},
-        "feature_windows": list(config.feature_windows),
         "future_buy_offset": config.future_buy_offset,
         "future_sell_offset": config.future_sell_offset,
         "label_bucket_count": config.label_bucket_count,
         "label_return_clip_quantile": config.label_return_clip_quantile,
         "head_sample_weight_quantile": config.head_sample_weight_quantile,
         "head_sample_weight_value": config.head_sample_weight_value,
-        "walk_forward_fold_count": config.walk_forward_fold_count,
+        "walk_forward_fold_count": len(walk_forward_splits),
+        "purge_group_count": config.purge_group_count,
+        "rebalance_stride": config.rebalance_stride,
+        "random_seed": config.random_seed,
         "result_columns": list(config.result_columns),
         "max_portfolio_size": config.max_portfolio_size,
         "portfolio_size": config.portfolio_size,
+        "training_data": {
+            "path": str(train_data_path),
+            "sha256": file_sha256(train_data_path),
+            "max_trade_date": pd.to_datetime(market_frame["trade_date"]).max().strftime("%Y-%m-%d"),
+            "row_count": int(len(market_frame)),
+            "stock_count": int(market_frame["stock_id"].nunique()),
+        },
         "xgb_params": {
             "objective": config.xgb_objective,
             "n_estimators": config.xgb_n_estimators,
@@ -545,13 +766,14 @@ def main() -> None:
             "min_samples_leaf": config.hgb_min_samples_leaf,
             "l2_regularization": config.hgb_l2_regularization,
         },
-    }
+    })
     write_json(model_metadata_path, metadata_payload)
 
     print("[训练] 多模型训练完成。")
     print(f"[训练] 特征数量：{len(feature_columns)}")
     print(f"[训练] 生产集成：{production_ensemble_method}")
-    print(f"[训练] Holdout 生产得分：{production_ensemble_metrics['top_k_relative_score']:.6f}")
+    print(f"[训练] 生产模型权重：{production_ensemble_weights}")
+    print(f"[训练] 生产组合参数：{final_risk}")
     print(f"[训练] XGBoost 模型：{ranker_model_xgb_path}")
     print(f"[训练] LightGBM 模型：{ranker_model_lgb_path}")
     print(f"[训练] HGB 模型：{ranker_model_hgb_path}")

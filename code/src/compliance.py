@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -22,6 +23,8 @@ def validate_submission_frame(
     max_positions: int,
     required_columns: tuple[str, str],
     weight_upper_bound: float,
+    exact_positions: int | None = None,
+    exact_weight: float | None = None,
 ) -> SubmissionCheckResult:
     expected_columns = list(required_columns)
     current_columns = list(df.columns)
@@ -36,6 +39,8 @@ def validate_submission_frame(
 
     if len(df) > max_positions:
         raise ValueError(f"结果文件最多只能包含 {max_positions} 只股票。")
+    if exact_positions is not None and len(df) != exact_positions:
+        raise ValueError(f"结果文件必须包含 {exact_positions} 只股票，当前为 {len(df)} 只。")
 
     stock_column, weight_column = required_columns
     normalized_stock_ids = df[stock_column].astype(str).str.strip().tolist()
@@ -51,6 +56,13 @@ def validate_submission_frame(
 
     if (weights < 0).any():
         raise ValueError("结果文件中的 weight 不能为负数。")
+    if exact_weight is not None and not np.allclose(
+        weights.to_numpy(dtype=float),
+        float(exact_weight),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError(f"结果文件中的每只股票权重必须为 {exact_weight}。")
 
     weight_sum = float(weights.sum())
     if weight_sum > weight_upper_bound + 1e-8:

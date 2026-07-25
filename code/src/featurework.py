@@ -716,6 +716,55 @@ def build_walk_forward_splits(
     return splits
 
 
+def select_rebalance_dates(frame: pd.DataFrame, stride: int) -> list[pd.Timestamp]:
+    if stride < 1:
+        raise ValueError("rebalance stride must be positive")
+    dates = sorted(pd.to_datetime(frame["trade_date"].drop_duplicates()).tolist())
+    return dates[::stride]
+
+
+def build_purged_walk_forward_splits(
+    ranking_frame: pd.DataFrame,
+    *,
+    fold_count: int,
+    validation_ratio: float,
+    min_train_groups: int,
+    purge_groups: int,
+) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    if fold_count < 1:
+        raise ValueError("fold_count must be positive")
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError("validation_ratio must be between zero and one")
+    if min_train_groups < 1 or purge_groups < 0:
+        raise ValueError("min_train_groups must be positive and purge_groups non-negative")
+
+    unique_dates = sorted(ranking_frame["trade_date"].drop_duplicates().tolist())
+    validation_size = max(1, int(round(len(unique_dates) * validation_ratio)))
+    available = len(unique_dates) - min_train_groups - purge_groups
+    actual_folds = min(fold_count, max(0, available // validation_size))
+    if actual_folds < 1:
+        raise ValueError("insufficient dates for purged walk-forward")
+
+    splits: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    for fold_index in range(actual_folds):
+        validation_end = len(unique_dates) - (actual_folds - fold_index - 1) * validation_size
+        validation_start = validation_end - validation_size
+        train_end = validation_start - purge_groups
+        train_dates = unique_dates[:train_end]
+        validation_dates = unique_dates[validation_start:validation_end]
+        if len(train_dates) < min_train_groups or not validation_dates:
+            continue
+        train_frame = ranking_frame[ranking_frame["trade_date"].isin(train_dates)].copy()
+        validation_frame = ranking_frame[ranking_frame["trade_date"].isin(validation_dates)].copy()
+        if train_frame.empty or validation_frame.empty:
+            continue
+        splits.append((train_frame, validation_frame))
+
+    if not splits:
+        raise ValueError("no valid purged walk-forward split")
+    return splits
+
+
 def build_training_bundle(
     raw_df: pd.DataFrame,
     *,
@@ -903,18 +952,25 @@ def calculate_top_k_return_metrics(
     scored_frame: pd.DataFrame,
     *,
     k: int,
+    rebalance_stride: int = 5,
 ) -> dict[str, float]:
+    if k < 1:
+        raise ValueError("k must be positive")
     evaluation_frame = scored_frame.copy()
+    evaluation_frame["trade_date"] = pd.to_datetime(evaluation_frame["trade_date"], errors="coerce")
+    evaluation_frame = evaluation_frame.dropna(subset=["trade_date", "future_return", "pred_score"])
     evaluation_frame = evaluation_frame.sort_values(["trade_date", "stock_id"]).reset_index(drop=True)
+    rebalance_dates = set(select_rebalance_dates(evaluation_frame, stride=rebalance_stride))
+    evaluation_frame = evaluation_frame[evaluation_frame["trade_date"].isin(rebalance_dates)].copy()
 
     predicted_values: list[float] = []
     oracle_values: list[float] = []
     baseline_values: list[float] = []
 
     for _, one_day_frame in evaluation_frame.groupby("trade_date", sort=True):
-        predicted_values.append(float(one_day_frame.nlargest(k, "pred_score")["future_return"].sum()))
-        oracle_values.append(float(one_day_frame.nlargest(k, "future_return")["future_return"].sum()))
-        baseline_values.append(float(one_day_frame["future_return"].mean() * min(k, len(one_day_frame))))
+        predicted_values.append(float(one_day_frame.nlargest(k, "pred_score")["future_return"].mean()))
+        oracle_values.append(float(one_day_frame.nlargest(k, "future_return")["future_return"].mean()))
+        baseline_values.append(float(one_day_frame["future_return"].mean()))
 
     pred_mean = float(np.mean(predicted_values)) if predicted_values else 0.0
     oracle_mean = float(np.mean(oracle_values)) if oracle_values else 0.0
@@ -925,9 +981,28 @@ def calculate_top_k_return_metrics(
     if abs(denominator) > 1e-12:
         normalized_score = (pred_mean - baseline_mean) / denominator
 
+    predicted_array = np.asarray(predicted_values, dtype=float)
+    if predicted_array.size:
+        tail_count = max(1, int(np.ceil(predicted_array.size * 0.1)))
+        pred_median = float(np.median(predicted_array))
+        pred_std = float(np.std(predicted_array))
+        pred_positive_rate = float(np.mean(predicted_array > 0))
+        pred_q10 = float(np.quantile(predicted_array, 0.1))
+        pred_cvar10 = float(np.sort(predicted_array)[:tail_count].mean())
+        pred_worst = float(np.min(predicted_array))
+    else:
+        pred_median = pred_std = pred_positive_rate = pred_q10 = pred_cvar10 = pred_worst = 0.0
+
     return {
         "pred_top_k_return_mean": round(pred_mean, 8),
+        "pred_top_k_return_median": round(pred_median, 8),
+        "pred_top_k_return_std": round(pred_std, 8),
+        "pred_top_k_positive_rate": round(pred_positive_rate, 8),
+        "pred_top_k_q10": round(pred_q10, 8),
+        "pred_top_k_cvar10": round(pred_cvar10, 8),
+        "pred_top_k_worst": round(pred_worst, 8),
         "oracle_top_k_return_mean": round(oracle_mean, 8),
         "baseline_top_k_return_mean": round(baseline_mean, 8),
         "top_k_relative_score": round(normalized_score, 8),
+        "evaluated_week_count": int(len(predicted_values)),
     }
