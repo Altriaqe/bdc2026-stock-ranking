@@ -190,3 +190,25 @@ temp/                     诊断报告和本地临时文件
 - 训练和推理只使用历史可见数据，不读取 `data/test.csv`；
 - 最终提交前必须按比赛目标周重新确认数据截点；
 - 线上结果阶段上传 `output/result.csv`，Docker 审核阶段再导出并上传镜像 tar。
+
+## 十、事务式最终发布
+
+最终数据刷新不建议手工拼接多个命令。使用发布器时，所有候选数据、模型、结果和 Docker tar 都先在 `temp/submission-release/<run-id>/` 中生成；只有数据、回测、格式、断网 Docker、哈希和 tar 门槛全部通过，才替换正式文件。
+
+```powershell
+.\.venv\Scripts\python.exe prepare_submission.py `
+  --cutoff-date 2026-07-31 `
+  --experiment-name xgb_ranker_v3 `
+  --docker-image bdc2026:latest `
+  --tar-name 霹雳.tar `
+  --push
+```
+
+发布器的失败语义：
+
+- 下载、校验、训练或 Docker 失败：正式数据、模型、结果和 tar 不变；
+- 发布中途失败：从 run 目录备份逆序恢复，并校验原哈希；
+- Git 推送失败：保留已验证的本地提交，标记未推送状态并返回非零退出码；
+- 成功后写入 `docs/validation/latest-submission.json`，记录截止日、回测、股票、哈希、耗时、Docker image 和远端 SHA。
+
+正式运行必须显式指定截止日，且必须在目标交易日数据已由 Baostock 更新后执行。当前已验证的 2026-07-24 结果不能替代 2026-07-31 收盘后的最终刷新。
