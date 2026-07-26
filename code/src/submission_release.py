@@ -239,6 +239,8 @@ def _copy_context(root: Path, context: Path, candidate_data: Path) -> None:
             result.update(name for name in names if name.endswith(".csv"))
         return result
 
+    if context.exists():
+        shutil.rmtree(context)
     shutil.copytree(root, context, ignore=ignore)
     context_data = context / "data"
     context_data.mkdir(parents=True, exist_ok=True)
