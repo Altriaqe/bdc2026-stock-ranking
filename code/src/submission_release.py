@@ -137,7 +137,7 @@ def _require_clean_git(workspace: Path) -> None:
 def _make_run_dir(workspace: Path) -> tuple[str, Path]:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     run_dir = workspace / "temp" / "submission-release" / run_id
-    for name in ("candidate/data", "candidate/model/xgb_ranker_v3", "candidate/output", "candidate/docs/validation", "docker-context", "docker-artifacts", "backup", "logs"):
+    for name in ("candidate/data", "candidate/model/xgb_ranker_v3", "candidate/output", "candidate/docs/validation", "docker-artifacts", "backup", "logs"):
         (run_dir / name).mkdir(parents=True, exist_ok=True)
     return run_id, run_dir
 
