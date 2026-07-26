@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-data", type=str, default=None, help="Inference input path, default data/train.csv")
     parser.add_argument("--test-data", type=str, default=None, help="Legacy alias for --inference-data")
     parser.add_argument("--experiment-name", type=str, default=None, help="Experiment directory name")
+    parser.add_argument("--output-path", type=str, default=None, help="Result output path, default output/result.csv")
+    parser.add_argument("--report-dir", type=str, default=None, help="Submission and portfolio report directory, default temp/")
     return parser.parse_args()
 
 
@@ -93,6 +95,10 @@ def main() -> None:
     experiment_name = args.experiment_name or config.experiment_name
     inference_data_arg = args.inference_data or args.test_data
     inference_data_path = Path(inference_data_arg) if inference_data_arg else config.inference_data_path
+    output_path = Path(args.output_path) if args.output_path else config.result_path
+    report_dir = Path(args.report_dir) if args.report_dir else config.temp_dir
+    submission_check_path = report_dir / config.submission_check_filename
+    portfolio_report_path = report_dir / config.portfolio_report_filename
     metadata_path = config.build_model_metadata_path(experiment_name)
 
     if not metadata_path.exists():
@@ -145,8 +151,8 @@ def main() -> None:
     submission = selection.submission
     model_names = list(models.keys())
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    submission.to_csv(config.result_path, index=False, encoding="utf-8", lineterminator="\n")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(output_path, index=False, encoding="utf-8", lineterminator="\n")
 
     check_result = validate_submission_frame(
         submission,
@@ -161,10 +167,9 @@ def main() -> None:
         unique_stock_count=check_result.unique_stock_count,
         weight_sum=check_result.weight_sum,
         stock_ids=check_result.stock_ids,
-        result_path=str(config.result_path),
+        result_path=str(output_path),
     )
-    write_submission_report(config.submission_check_path, final_result)
-    portfolio_report_path = config.temp_dir / config.portfolio_report_filename
+    write_submission_report(submission_check_path, final_result)
     portfolio_report_path.parent.mkdir(parents=True, exist_ok=True)
     portfolio_report_path.write_text(
         json.dumps(
@@ -181,7 +186,7 @@ def main() -> None:
                 "mean_correlation": selection.mean_correlation,
                 "selection_score": selection.selection_score,
                 "degraded_reason": selection.degraded_reason,
-                "result_sha256": file_sha256(config.result_path),
+                "result_sha256": file_sha256(output_path),
             },
             indent=2,
             ensure_ascii=False,
@@ -194,11 +199,11 @@ def main() -> None:
     print(f"[inference] models: {model_names}")
     print(f"[inference] ensemble_weights: {ensemble_weights}")
     print(f"[inference] portfolio: {portfolio_config}")
-    print(f"[inference] result: {config.result_path}")
+    print(f"[inference] result: {output_path}")
     print(f"[inference] row_count: {final_result.row_count}")
     print(f"[inference] stock_ids: {final_result.stock_ids}")
     print(f"[inference] weight_sum: {final_result.weight_sum:.6f}")
-    print(f"[inference] check_report: {config.submission_check_path}")
+    print(f"[inference] check_report: {submission_check_path}")
     print(f"[inference] portfolio_report: {portfolio_report_path}")
 
 
