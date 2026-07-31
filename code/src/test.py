@@ -117,10 +117,12 @@ def main() -> None:
     ensemble_method = metadata.get("ensemble_method", "")
     ensemble_weights: dict[str, float] = metadata.get("ensemble_weights", {})
     portfolio_config: dict[str, object] = metadata.get("portfolio", {})
-    if ensemble_method != "equal_rank_average":
+    if ensemble_method not in {"equal_rank_average", "single_model"}:
         raise ValueError(f"Unsupported production ensemble method: {ensemble_method}")
-    if set(selected_models) != {"xgb_ranker", "lgb_ranker", "hgb_regressor"}:
-        raise ValueError("Robust production inference requires all three models.")
+    if ensemble_method == "equal_rank_average" and set(selected_models) != {"xgb_ranker", "lgb_ranker", "hgb_regressor"}:
+        raise ValueError("Equal-rank production inference requires all three models.")
+    if ensemble_method == "single_model" and selected_models != ["xgb_ranker"]:
+        raise ValueError("Single-model production inference requires xgb_ranker.")
     if int(portfolio_config.get("size", 0)) != 5:
         raise ValueError("Robust production metadata must request exactly five stocks.")
 
@@ -135,10 +137,10 @@ def main() -> None:
 
     x = inference_frame[feature_columns]
     score_map = {model_name: predict_model(model_name, model, x) for model_name, model in models.items()}
-    inference_frame["pred_score"] = combine_rank_scores(
-        score_map,
-        ensemble_weights,
-        inference_frame["stock_id"],
+    inference_frame["pred_score"] = (
+        score_map["xgb_ranker"]
+        if ensemble_method == "single_model"
+        else combine_rank_scores(score_map, ensemble_weights, inference_frame["stock_id"])
     )
     selection = select_top5_portfolio(
         inference_frame,

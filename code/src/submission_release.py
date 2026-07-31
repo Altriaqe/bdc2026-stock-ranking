@@ -195,8 +195,6 @@ def run_local_candidate(config: ReleaseConfig, run_id: str, run_dir: Path, data_
             experiment,
             "--feature-preset",
             "alpha_v1",
-            "--production-models",
-            "xgb_ranker,lgb_ranker,hgb_regressor",
             "--production-portfolio-size",
             "5",
         ],

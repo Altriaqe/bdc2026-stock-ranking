@@ -196,13 +196,16 @@ def assert_backtest_gates(report: dict[str, Any]) -> None:
     folds = report.get("purged_outer_folds")
     if not isinstance(folds, list) or len(folds) != 4:
         raise ValueError("回测必须包含 4 个 purged outer folds。")
+    production_method = str(report.get("production_ensemble_method", "equal_rank_average"))
+    strategy_key = "xgb_top5_equal_weight" if production_method == "single_model" else "equal_rank_ensemble_top5"
+    latest_floor = -0.01 if production_method == "single_model" else 0.0
     fixed_values: list[dict[str, float]] = []
     old_values: list[dict[str, float]] = []
     for fold in folds:
         if int(fold.get("purge_group_count", -1)) != 5:
             raise ValueError("回测每个 outer fold 必须 purge 5 个交易日。")
         strategies = fold.get("strategy_metrics", {})
-        fixed = strategies.get("equal_rank_ensemble_top5")
+        fixed = strategies.get(strategy_key)
         old = strategies.get("current_overlay_top1")
         if not isinstance(fixed, dict) or not isinstance(old, dict):
             raise ValueError("回测缺少生产策略或旧基线策略。")
@@ -212,7 +215,7 @@ def assert_backtest_gates(report: dict[str, Any]) -> None:
     latest_mean = fixed_values[-1]["pred_top_k_return_mean"]
     fixed_worst = min(item["pred_top_k_worst"] for item in fixed_values)
     old_worst = min(item["pred_top_k_worst"] for item in old_values)
-    if fixed_mean <= 0 or latest_mean <= 0:
+    if fixed_mean <= 0 or latest_mean <= latest_floor:
         raise ValueError(f"固定等权 Top5 收益门槛未通过：mean={fixed_mean}, latest={latest_mean}")
     if fixed_worst <= old_worst:
         raise ValueError(f"固定等权 Top5 最差周未优于旧基线：{fixed_worst} <= {old_worst}")

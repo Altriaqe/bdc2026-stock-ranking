@@ -347,12 +347,13 @@ def build_production_metadata(
     variance_penalty: float,
     correlation_penalty: float,
     config: ProjectConfig | None = None,
+    ensemble_method: str = "equal_rank_average",
 ) -> dict[str, object]:
     resolved = config or ProjectConfig()
     return {
-        "model_type": "xgboost_lightgbm_hgb_equal_rank_ensemble",
+        "model_type": "xgboost_single_ranker" if ensemble_method == "single_model" else "xgboost_lightgbm_hgb_equal_rank_ensemble",
         "selected_models": list(model_weights),
-        "ensemble_method": "equal_rank_average",
+        "ensemble_method": ensemble_method,
         "ensemble_weights": {name: float(weight) for name, weight in model_weights.items()},
         "feature_columns": feature_columns,
         "feature_windows": list(feature_windows),
@@ -647,12 +648,13 @@ def main() -> None:
     if args.production_models:
         production_selected_models = [item.strip() for item in args.production_models.split(",") if item.strip()]
     else:
-        production_selected_models = list(base_config.production_model_names)
+        production_selected_models = ["xgb_ranker"]
     required_models = {"xgb_ranker", "lgb_ranker", "hgb_regressor"}
     if set(production_selected_models) != required_models:
         raise ValueError("稳健生产路径必须同时使用 xgb_ranker、lgb_ranker 和 hgb_regressor。")
-    production_selected_models = ["xgb_ranker", "lgb_ranker", "hgb_regressor"]
-    production_ensemble_method = "equal_rank_average"
+    if set(production_selected_models) not in ({"xgb_ranker"}, required_models):
+        raise ValueError("production-models must be xgb_ranker or all three production models")
+    production_ensemble_method = "single_model" if production_selected_models == ["xgb_ranker"] else "equal_rank_average"
     production_ensemble_weights = {
         name: 1.0 / len(production_selected_models) for name in production_selected_models
     }
@@ -727,6 +729,7 @@ def main() -> None:
         feature_columns=feature_columns,
         feature_windows=config.feature_windows,
         model_weights=production_ensemble_weights,
+        ensemble_method=production_ensemble_method,
         variance_penalty=float(production_risk["variance_penalty"]),
         correlation_penalty=float(production_risk["correlation_penalty"]),
         config=config,
