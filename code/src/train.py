@@ -650,8 +650,6 @@ def main() -> None:
     else:
         production_selected_models = ["xgb_ranker"]
     required_models = {"xgb_ranker", "lgb_ranker", "hgb_regressor"}
-    if set(production_selected_models) != required_models:
-        raise ValueError("稳健生产路径必须同时使用 xgb_ranker、lgb_ranker 和 hgb_regressor。")
     if set(production_selected_models) not in ({"xgb_ranker"}, required_models):
         raise ValueError("production-models must be xgb_ranker or all three production models")
     production_ensemble_method = "single_model" if production_selected_models == ["xgb_ranker"] else "equal_rank_average"
